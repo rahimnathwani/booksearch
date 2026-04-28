@@ -12,18 +12,25 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Terminal,
 };
+use ratatui_image::{picker::Picker, protocol::StatefulProtocol, StatefulImage};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
+    hash::{DefaultHasher, Hash, Hasher},
     io::{self, Stdout},
     path::{Path, PathBuf},
     process::Command,
+    sync::mpsc::{self, Receiver, Sender, TryRecvError},
+    thread,
     time::{Duration, UNIX_EPOCH},
 };
 use walkdir::WalkDir;
 
-const INDEX_FILE: &str = ".booksearch_index.json";
+const DB_FILE: &str = ".booksearch.db";
+const COVER_DIR: &str = ".booksearch_covers";
+const BATCH_SIZE: usize = 15;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct BookEntry {
@@ -33,12 +40,7 @@ struct BookEntry {
     title: String,
     author: String,
     metadata: BTreeMap<String, String>,
-    raw: String,
-}
-
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct Index {
-    books: BTreeMap<String, BookEntry>,
+    cover: Option<String>,
 }
 
 fn mtime_secs(p: &Path) -> u64 {
@@ -73,9 +75,18 @@ fn parse_ebook_meta(out: &str) -> (String, String, BTreeMap<String, String>) {
     (title, author, map)
 }
 
-fn extract_metadata(path: &Path) -> BookEntry {
+fn cover_filename(rel: &str) -> String {
+    let mut h = DefaultHasher::new();
+    rel.hash(&mut h);
+    format!("{:016x}.jpg", h.finish())
+}
+
+fn extract_metadata(epub: &Path, cover_dir: &Path, rel: &str) -> BookEntry {
     let mut entry = BookEntry::default();
-    let output = Command::new("ebook-meta").arg(path).output();
+    let cover_path = cover_dir.join(cover_filename(rel));
+    let _ = fs::remove_file(&cover_path);
+    let cover_arg = format!("--get-cover={}", cover_path.display());
+    let output = Command::new("ebook-meta").arg(epub).arg(&cover_arg).output();
     if let Ok(out) = output {
         if out.status.success() {
             let s = String::from_utf8_lossy(&out.stdout).to_string();
@@ -83,19 +94,130 @@ fn extract_metadata(path: &Path) -> BookEntry {
             entry.title = title;
             entry.author = author;
             entry.metadata = map;
-            entry.raw = s;
         }
+    }
+    if cover_path.exists() && fs::metadata(&cover_path).map(|m| m.len() > 0).unwrap_or(false) {
+        entry.cover = Some(cover_path.to_string_lossy().to_string());
     }
     entry
 }
 
-fn build_or_update_index(root: &Path) -> Result<Index> {
-    let index_path = root.join(INDEX_FILE);
-    let mut index: Index = if index_path.exists() {
-        let data = fs::read_to_string(&index_path)?;
-        serde_json::from_str(&data).unwrap_or_default()
-    } else {
-        Index::default()
+fn open_db(root: &Path) -> Result<Connection> {
+    let conn = Connection::open(root.join(DB_FILE))?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS books (
+            path TEXT PRIMARY KEY,
+            size INTEGER NOT NULL,
+            mtime INTEGER NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            author TEXT NOT NULL DEFAULT '',
+            cover TEXT,
+            metadata TEXT NOT NULL DEFAULT '{}'
+         );
+         CREATE VIRTUAL TABLE IF NOT EXISTS books_fts USING fts5(
+            path UNINDEXED,
+            title,
+            author,
+            filename,
+            tokenize = 'unicode61 remove_diacritics 1'
+         );",
+    )?;
+    Ok(conn)
+}
+
+fn load_all_books(conn: &Connection) -> Result<Vec<BookEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT path,size,mtime,title,author,cover,metadata FROM books \
+         ORDER BY title COLLATE NOCASE, author COLLATE NOCASE, path COLLATE NOCASE",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        let metadata: String = r.get(6)?;
+        let map: BTreeMap<String, String> = serde_json::from_str(&metadata).unwrap_or_default();
+        Ok(BookEntry {
+            path: r.get(0)?,
+            size: r.get::<_, i64>(1)? as u64,
+            mtime: r.get::<_, i64>(2)? as u64,
+            title: r.get(3)?,
+            author: r.get(4)?,
+            cover: r.get(5)?,
+            metadata: map,
+        })
+    })?;
+    Ok(rows.filter_map(Result::ok).collect())
+}
+
+fn upsert_book(conn: &Connection, e: &BookEntry) -> Result<()> {
+    let metadata_json = serde_json::to_string(&e.metadata)?;
+    conn.execute(
+        "INSERT INTO books(path,size,mtime,title,author,cover,metadata) VALUES(?1,?2,?3,?4,?5,?6,?7)
+         ON CONFLICT(path) DO UPDATE SET size=excluded.size,mtime=excluded.mtime,
+            title=excluded.title,author=excluded.author,cover=excluded.cover,metadata=excluded.metadata",
+        params![
+            e.path,
+            e.size as i64,
+            e.mtime as i64,
+            e.title,
+            e.author,
+            e.cover,
+            metadata_json
+        ],
+    )?;
+    let filename = Path::new(&e.path)
+        .file_name()
+        .map(|s| s.to_string_lossy().replace('_', " "))
+        .unwrap_or_default();
+    conn.execute("DELETE FROM books_fts WHERE path = ?1", params![e.path])?;
+    conn.execute(
+        "INSERT INTO books_fts(path,title,author,filename) VALUES(?1,?2,?3,?4)",
+        params![e.path, e.title, e.author, filename],
+    )?;
+    Ok(())
+}
+
+fn delete_book(conn: &Connection, path: &str) -> Result<()> {
+    conn.execute("DELETE FROM books WHERE path = ?1", params![path])?;
+    conn.execute("DELETE FROM books_fts WHERE path = ?1", params![path])?;
+    Ok(())
+}
+
+#[derive(Debug)]
+enum IndexUpdate {
+    Total(usize),
+    Book(BookEntry),
+    Removed(String),
+    Progress { done: usize, total: usize },
+    Done,
+}
+
+fn spawn_indexer(root: PathBuf, tx: Sender<IndexUpdate>) {
+    thread::spawn(move || {
+        if let Err(e) = run_indexer(&root, &tx) {
+            eprintln!("indexer error: {e}");
+        }
+        let _ = tx.send(IndexUpdate::Done);
+    });
+}
+
+fn run_indexer(root: &Path, tx: &Sender<IndexUpdate>) -> Result<()> {
+    let cover_dir = root.join(COVER_DIR);
+    fs::create_dir_all(&cover_dir).ok();
+    let conn = open_db(root)?;
+
+    let existing: HashMap<String, (i64, i64, Option<String>)> = {
+        let mut stmt = conn.prepare("SELECT path,size,mtime,cover FROM books")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        rows.filter_map(Result::ok)
+            .map(|(p, s, m, c)| (p, (s, m, c)))
+            .collect()
     };
 
     let mut found: Vec<(String, u64, u64, PathBuf)> = Vec::new();
@@ -104,95 +226,222 @@ fn build_or_update_index(root: &Path) -> Result<Index> {
         if !p.is_file() {
             continue;
         }
-        if p.extension().and_then(|e| e.to_str()).map(|s| s.eq_ignore_ascii_case("epub")) != Some(true) {
+        if p.extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.eq_ignore_ascii_case("epub"))
+            != Some(true)
+        {
             continue;
         }
-        let rel = p.strip_prefix(root).unwrap_or(p).to_string_lossy().to_string();
+        let rel = p
+            .strip_prefix(root)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .to_string();
         let md = match fs::metadata(p) {
             Ok(m) => m,
             Err(_) => continue,
         };
         found.push((rel, md.len(), mtime_secs(p), p.to_path_buf()));
     }
+    let found_keys: HashSet<String> = found.iter().map(|(r, _, _, _)| r.clone()).collect();
 
-    let found_keys: std::collections::HashSet<String> =
-        found.iter().map(|(r, _, _, _)| r.clone()).collect();
-    index.books.retain(|k, _| found_keys.contains(k));
-
-    let total = found.len();
-    let to_index: Vec<(String, u64, u64, PathBuf)> = found
-        .iter()
-        .filter(|f| match index.books.get(&f.0) {
-            Some(b) => b.size != f.1 || b.mtime != f.2,
-            None => true,
-        })
-        .cloned()
-        .collect();
-
-    if !to_index.is_empty() {
-        eprintln!("Indexing {}/{} epub files...", to_index.len(), total);
-        for (i, (rel, size, mt, path)) in to_index.iter().enumerate() {
-            eprintln!("  [{}/{}] {}", i + 1, to_index.len(), rel);
-            let mut e = extract_metadata(path);
-            e.path = rel.clone();
-            e.size = *size;
-            e.mtime = *mt;
-            index.books.insert(rel.clone(), e);
+    for (path, (_, _, cover)) in &existing {
+        if !found_keys.contains(path) {
+            if let Some(c) = cover {
+                let _ = fs::remove_file(c);
+            }
+            delete_book(&conn, path)?;
+            let _ = tx.send(IndexUpdate::Removed(path.clone()));
         }
-        let data = serde_json::to_string_pretty(&index)?;
-        fs::write(&index_path, data)?;
     }
 
-    Ok(index)
+    let to_index: Vec<(String, u64, u64, PathBuf)> = found
+        .into_iter()
+        .filter(|(rel, size, mt, _)| match existing.get(rel) {
+            Some((s, m, c)) => {
+                *s as u64 != *size
+                    || *m as u64 != *mt
+                    || c.as_ref().map(|p| !Path::new(p).exists()).unwrap_or(false)
+            }
+            None => true,
+        })
+        .collect();
+
+    let total = to_index.len();
+    let _ = tx.send(IndexUpdate::Total(total));
+    if total == 0 {
+        return Ok(());
+    }
+
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let mut in_batch = 0usize;
+    for (i, (rel, size, mt, path)) in to_index.into_iter().enumerate() {
+        let mut e = extract_metadata(&path, &cover_dir, &rel);
+        e.path = rel.clone();
+        e.size = size;
+        e.mtime = mt;
+        upsert_book(&conn, &e)?;
+        let _ = tx.send(IndexUpdate::Book(e));
+        let _ = tx.send(IndexUpdate::Progress {
+            done: i + 1,
+            total,
+        });
+        in_batch += 1;
+        if in_batch >= BATCH_SIZE {
+            conn.execute_batch("COMMIT; BEGIN IMMEDIATE")?;
+            in_batch = 0;
+        }
+    }
+    if in_batch > 0 {
+        conn.execute_batch("COMMIT")?;
+    } else {
+        conn.execute_batch("COMMIT")?;
+    }
+    Ok(())
 }
 
-#[derive(Default)]
 struct App {
     filter: String,
     list_state: ListState,
-    books: Vec<BookEntry>,
-    filtered: Vec<usize>,
+    books: HashMap<String, BookEntry>,
+    all_paths: Vec<String>,
+    filtered: Vec<String>,
+    rx: Receiver<IndexUpdate>,
+    progress: Option<(usize, usize)>,
+    indexing_done: bool,
+    picker: Option<Picker>,
+    cover_cache: HashMap<String, Option<StatefulProtocol>>,
 }
 
 impl App {
-    fn new(books: Vec<BookEntry>) -> Self {
+    fn new(initial: Vec<BookEntry>, rx: Receiver<IndexUpdate>, picker: Option<Picker>) -> Self {
+        let mut books = HashMap::new();
+        let mut all_paths = Vec::with_capacity(initial.len());
+        for b in initial {
+            all_paths.push(b.path.clone());
+            books.insert(b.path.clone(), b);
+        }
         let mut a = App {
+            filter: String::new(),
+            list_state: ListState::default(),
             books,
-            ..Default::default()
+            all_paths,
+            filtered: Vec::new(),
+            rx,
+            progress: None,
+            indexing_done: false,
+            picker,
+            cover_cache: HashMap::new(),
         };
+        a.sort_paths();
         a.recompute_filter();
         a
     }
 
-    fn search_haystack(b: &BookEntry) -> String {
+    fn sort_paths(&mut self) {
+        let books = &self.books;
+        self.all_paths.sort_by(|a, b| {
+            let ba = books.get(a);
+            let bb = books.get(b);
+            let ka = ba.map(|x| (x.title.to_lowercase(), x.author.to_lowercase(), a.clone()));
+            let kb = bb.map(|x| (x.title.to_lowercase(), x.author.to_lowercase(), b.clone()));
+            ka.cmp(&kb)
+        });
+    }
+
+    fn drain_updates(&mut self) -> bool {
+        let mut changed = false;
+        let mut got_book = false;
+        loop {
+            match self.rx.try_recv() {
+                Ok(IndexUpdate::Total(t)) => {
+                    self.progress = Some((0, t));
+                    changed = true;
+                }
+                Ok(IndexUpdate::Progress { done, total }) => {
+                    self.progress = Some((done, total));
+                    changed = true;
+                }
+                Ok(IndexUpdate::Book(b)) => {
+                    let path = b.path.clone();
+                    let is_new = !self.books.contains_key(&path);
+                    self.books.insert(path.clone(), b);
+                    if is_new {
+                        self.all_paths.push(path.clone());
+                    }
+                    self.cover_cache.remove(&path);
+                    got_book = true;
+                    changed = true;
+                }
+                Ok(IndexUpdate::Removed(path)) => {
+                    self.books.remove(&path);
+                    self.all_paths.retain(|p| p != &path);
+                    self.cover_cache.remove(&path);
+                    changed = true;
+                }
+                Ok(IndexUpdate::Done) => {
+                    self.indexing_done = true;
+                    changed = true;
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.indexing_done = true;
+                    break;
+                }
+            }
+        }
+        if got_book {
+            self.sort_paths();
+        }
+        if changed {
+            let prev = self
+                .list_state
+                .selected()
+                .and_then(|i| self.filtered.get(i).cloned());
+            self.recompute_filter();
+            if let Some(p) = prev {
+                if let Some(i) = self.filtered.iter().position(|x| x == &p) {
+                    self.list_state.select(Some(i));
+                }
+            }
+        }
+        changed
+    }
+
+    fn match_book(b: &BookEntry, terms: &[String]) -> bool {
+        if terms.is_empty() {
+            return true;
+        }
         let fname = Path::new(&b.path)
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default()
             .replace('_', " ");
-        format!("{} {} {}", fname, b.title, b.author).to_lowercase()
+        let hay = format!("{} {} {}", fname, b.title, b.author).to_lowercase();
+        terms.iter().all(|t| hay.contains(t))
     }
 
     fn recompute_filter(&mut self) {
         let q = self.filter.trim().to_lowercase();
-        let terms: Vec<&str> = q.split_whitespace().collect();
+        let terms: Vec<String> = q.split_whitespace().map(|s| s.to_string()).collect();
         self.filtered = self
-            .books
+            .all_paths
             .iter()
-            .enumerate()
-            .filter(|(_, b)| {
-                if terms.is_empty() {
-                    return true;
-                }
-                let h = Self::search_haystack(b);
-                terms.iter().all(|t| h.contains(t))
+            .filter(|p| {
+                self.books
+                    .get(*p)
+                    .map(|b| Self::match_book(b, &terms))
+                    .unwrap_or(false)
             })
-            .map(|(i, _)| i)
+            .cloned()
             .collect();
         if self.filtered.is_empty() {
             self.list_state.select(None);
         } else {
-            self.list_state.select(Some(0));
+            let cur = self.list_state.selected().unwrap_or(0);
+            self.list_state
+                .select(Some(cur.min(self.filtered.len() - 1)));
         }
     }
 
@@ -206,21 +455,44 @@ impl App {
         self.list_state.select(Some(new as usize));
     }
 
-    fn selected_book(&self) -> Option<&BookEntry> {
+    fn selected_path(&self) -> Option<&String> {
         let idx = self.list_state.selected()?;
-        let bidx = *self.filtered.get(idx)?;
-        self.books.get(bidx)
+        self.filtered.get(idx)
+    }
+
+    fn selected_book(&self) -> Option<&BookEntry> {
+        let p = self.selected_path()?;
+        self.books.get(p)
+    }
+
+    fn current_cover_protocol(&mut self) -> Option<&mut StatefulProtocol> {
+        let path = self.selected_path()?.clone();
+        if !self.cover_cache.contains_key(&path) {
+            let proto = self.load_cover(&path);
+            self.cover_cache.insert(path.clone(), proto);
+        }
+        self.cover_cache.get_mut(&path).and_then(|o| o.as_mut())
+    }
+
+    fn load_cover(&self, path: &str) -> Option<StatefulProtocol> {
+        let picker = self.picker.as_ref()?;
+        let book = self.books.get(path)?;
+        let cover_path = book.cover.as_ref()?;
+        let img = image::ImageReader::open(cover_path).ok()?.decode().ok()?;
+        Some(picker.new_resize_protocol(img))
     }
 }
 
-fn run_tui(books: Vec<BookEntry>) -> Result<()> {
+fn run_tui(initial: Vec<BookEntry>, rx: Receiver<IndexUpdate>) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let mut app = App::new(books);
+    let picker = Picker::from_query_stdio().ok();
+
+    let mut app = App::new(initial, rx, picker);
     let res = event_loop(&mut terminal, &mut app);
 
     disable_raw_mode()?;
@@ -235,10 +507,12 @@ fn run_tui(books: Vec<BookEntry>) -> Result<()> {
 
 fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     loop {
+        app.drain_updates();
         terminal.draw(|f| draw(f, app))?;
-        if event::poll(Duration::from_millis(250))? {
+        if event::poll(Duration::from_millis(150))? {
             if let Event::Key(key) = event::read()? {
-                if key.kind != event::KeyEventKind::Press && key.kind != event::KeyEventKind::Repeat {
+                if key.kind != event::KeyEventKind::Press && key.kind != event::KeyEventKind::Repeat
+                {
                     continue;
                 }
                 match key.code {
@@ -250,9 +524,11 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
                     KeyCode::Down => app.move_selection(1),
                     KeyCode::PageUp => app.move_selection(-10),
                     KeyCode::PageDown => app.move_selection(10),
-                    KeyCode::Home => app
-                        .list_state
-                        .select(if app.filtered.is_empty() { None } else { Some(0) }),
+                    KeyCode::Home => app.list_state.select(if app.filtered.is_empty() {
+                        None
+                    } else {
+                        Some(0)
+                    }),
                     KeyCode::End => {
                         if !app.filtered.is_empty() {
                             app.list_state.select(Some(app.filtered.len() - 1));
@@ -280,11 +556,22 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         .split(f.area());
 
     let filter_text = format!("{}_", app.filter);
-    let filter = Paragraph::new(filter_text).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!("Filter ({} matches)", app.filtered.len())),
-    );
+    let title = match (app.progress, app.indexing_done) {
+        (_, true) => format!(
+            "Filter ({} matches, {} books)",
+            app.filtered.len(),
+            app.books.len()
+        ),
+        (Some((d, t)), false) if t > 0 => format!(
+            "Filter ({} matches, indexing {}/{})",
+            app.filtered.len(),
+            d,
+            t
+        ),
+        _ => format!("Filter ({} matches, scanning...)", app.filtered.len()),
+    };
+    let filter = Paragraph::new(filter_text)
+        .block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(filter, chunks[0]);
 
     let body = Layout::default()
@@ -295,8 +582,8 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     let items: Vec<ListItem> = app
         .filtered
         .iter()
-        .map(|&i| {
-            let b = &app.books[i];
+        .filter_map(|p| app.books.get(p))
+        .map(|b| {
             let label = if !b.title.is_empty() {
                 let auth = if b.author.is_empty() {
                     String::new()
@@ -319,6 +606,26 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, body[0], &mut app.list_state);
+
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(45), Constraint::Min(1)])
+        .split(body[1]);
+
+    let cover_block = Block::default().borders(Borders::ALL).title("Cover");
+    let cover_inner = cover_block.inner(right[0]);
+    f.render_widget(cover_block, right[0]);
+    if let Some(proto) = app.current_cover_protocol() {
+        let img = StatefulImage::<StatefulProtocol>::default();
+        f.render_stateful_widget(img, cover_inner, proto);
+    } else {
+        let msg = if app.picker.is_none() {
+            "(terminal does not support images)"
+        } else {
+            "(no cover)"
+        };
+        f.render_widget(Paragraph::new(msg), cover_inner);
+    }
 
     let detail_lines: Vec<Line> = match app.selected_book() {
         Some(b) => {
@@ -357,7 +664,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     let details = Paragraph::new(detail_lines)
         .block(Block::default().borders(Borders::ALL).title("Details"))
         .wrap(Wrap { trim: false });
-    f.render_widget(details, body[1]);
+    f.render_widget(details, right[1]);
 
     let help = Paragraph::new(
         "Type to filter · Backspace · ↑↓ navigate · PgUp/PgDn · Home/End · Esc quit",
@@ -367,12 +674,13 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
 
 fn main() -> Result<()> {
     let cwd = std::env::current_dir().context("getting cwd")?;
-    let index = build_or_update_index(&cwd)?;
-    let books: Vec<BookEntry> = index.books.into_values().collect();
-    if books.is_empty() {
-        eprintln!("No .epub files found in {}", cwd.display());
-        return Ok(());
-    }
-    run_tui(books)?;
+    let conn = open_db(&cwd)?;
+    let initial = load_all_books(&conn)?;
+    drop(conn);
+
+    let (tx, rx) = mpsc::channel();
+    spawn_indexer(cwd.clone(), tx);
+
+    run_tui(initial, rx)?;
     Ok(())
 }

@@ -4,12 +4,15 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 walkdir = "2"
 anyhow = "1"
+ratatui-image = { version = "10", default-features = false, features = ["crossterm"] }
+image = "0.25"
+rusqlite = { version = "0.32", features = ["bundled"] }
 
 [profile.release]
 lto = true
