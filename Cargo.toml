@@ -13,6 +13,7 @@ anyhow = "1"
 ratatui-image = { version = "10", default-features = false, features = ["crossterm"] }
 image = "0.25"
 rusqlite = { version = "0.32", features = ["bundled"] }
+rbook = "0.7"
 
 [profile.release]
 lto = true

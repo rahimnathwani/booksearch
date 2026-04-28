@@ -81,7 +81,69 @@ fn cover_filename(rel: &str) -> String {
     format!("{:016x}.jpg", h.finish())
 }
 
-fn extract_metadata(epub: &Path, cover_dir: &Path, rel: &str) -> BookEntry {
+fn extract_metadata_rbook(epub_path: &Path, cover_dir: &Path, rel: &str) -> Option<BookEntry> {
+    use rbook::Epub;
+
+    let epub = Epub::options()
+        .skip_toc(true)
+        .skip_spine(true)
+        .open(epub_path)
+        .ok()?;
+    let meta = epub.metadata();
+
+    let title = meta.title().map(|t| t.value().to_string()).unwrap_or_default();
+    let authors: Vec<String> = meta.creators().map(|c| c.value().to_string()).collect();
+    let author = authors.join(" & ");
+
+    let mut map = BTreeMap::new();
+    if !title.is_empty() {
+        map.insert("Title".into(), title.clone());
+    }
+    if !author.is_empty() {
+        map.insert("Author(s)".into(), author.clone());
+    }
+    let publishers: Vec<String> = meta.publishers().map(|p| p.value().to_string()).collect();
+    if !publishers.is_empty() {
+        map.insert("Publisher".into(), publishers.join(", "));
+    }
+    if let Some(lang) = meta.language() {
+        map.insert("Languages".into(), lang.value().to_string());
+    }
+    if let Some(d) = meta.description() {
+        map.insert("Comments".into(), d.value().to_string());
+    }
+    if let Some(id) = meta.identifier() {
+        map.insert("Identifiers".into(), id.value().to_string());
+    }
+    let tags: Vec<String> = meta.tags().map(|t| t.value().to_string()).collect();
+    if !tags.is_empty() {
+        map.insert("Tags".into(), tags.join(", "));
+    }
+
+    let cover_path = cover_dir.join(cover_filename(rel));
+    let _ = fs::remove_file(&cover_path);
+    let cover = epub
+        .manifest()
+        .cover_image()
+        .and_then(|c| c.read_bytes().ok())
+        .filter(|b| !b.is_empty())
+        .and_then(|bytes| {
+            fs::write(&cover_path, &bytes).ok()?;
+            Some(cover_path.to_string_lossy().to_string())
+        });
+
+    Some(BookEntry {
+        path: String::new(),
+        size: 0,
+        mtime: 0,
+        title,
+        author,
+        metadata: map,
+        cover,
+    })
+}
+
+fn extract_metadata_external(epub: &Path, cover_dir: &Path, rel: &str) -> BookEntry {
     let mut entry = BookEntry::default();
     let cover_path = cover_dir.join(cover_filename(rel));
     let _ = fs::remove_file(&cover_path);
@@ -100,6 +162,20 @@ fn extract_metadata(epub: &Path, cover_dir: &Path, rel: &str) -> BookEntry {
         entry.cover = Some(cover_path.to_string_lossy().to_string());
     }
     entry
+}
+
+fn extract_metadata(file: &Path, cover_dir: &Path, rel: &str) -> BookEntry {
+    let is_epub = file
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.eq_ignore_ascii_case("epub"))
+        .unwrap_or(false);
+    if is_epub {
+        if let Some(e) = extract_metadata_rbook(file, cover_dir, rel) {
+            return e;
+        }
+    }
+    extract_metadata_external(file, cover_dir, rel)
 }
 
 fn open_db(root: &Path) -> Result<Connection> {
@@ -484,7 +560,12 @@ impl App {
         let picker = self.picker.as_ref()?;
         let book = self.books.get(path)?;
         let cover_path = book.cover.as_ref()?;
-        let img = image::ImageReader::open(cover_path).ok()?.decode().ok()?;
+        let img = image::ImageReader::open(cover_path)
+            .ok()?
+            .with_guessed_format()
+            .ok()?
+            .decode()
+            .ok()?;
         Some(picker.new_resize_protocol(img))
     }
 }
