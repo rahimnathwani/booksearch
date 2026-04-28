@@ -226,11 +226,17 @@ fn run_indexer(root: &Path, tx: &Sender<IndexUpdate>) -> Result<()> {
         if !p.is_file() {
             continue;
         }
-        if p.extension()
+        let ext_ok = p
+            .extension()
             .and_then(|e| e.to_str())
-            .map(|s| s.eq_ignore_ascii_case("epub"))
-            != Some(true)
-        {
+            .map(|s| {
+                matches!(
+                    s.to_ascii_lowercase().as_str(),
+                    "epub" | "azw3" | "azw" | "mobi" | "pdf" | "fb2" | "lit" | "lrf" | "kfx"
+                )
+            })
+            .unwrap_or(false);
+        if !ext_ok {
             continue;
         }
         let rel = p
