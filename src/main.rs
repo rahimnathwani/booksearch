@@ -21,16 +21,18 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher},
     io::{self, Stdout},
     path::{Path, PathBuf},
-    process::Command,
-    sync::mpsc::{self, Receiver, Sender, TryRecvError},
+    process::{Command, Stdio},
+    sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TryRecvError},
     thread,
-    time::{Duration, UNIX_EPOCH},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 use walkdir::WalkDir;
 
 const DB_FILE: &str = ".booksearch.db";
 const COVER_DIR: &str = ".booksearch_covers";
 const BATCH_SIZE: usize = 15;
+const PARSE_TIMEOUT: Duration = Duration::from_secs(60);
+const CHECKPOINT_EVERY_BATCHES: usize = 10;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct BookEntry {
@@ -43,13 +45,20 @@ struct BookEntry {
     cover: Option<String>,
 }
 
-fn mtime_secs(p: &Path) -> u64 {
-    fs::metadata(p)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+/// Sequentially read the file to warm the OS page cache before parsing.
+/// On spinning disks this converts the parser's later random seeks (zip central
+/// directory at EOF, then back to individual entries) into RAM hits.
+fn prewarm_file(path: &Path) {
+    use std::io::Read;
+    if let Ok(mut f) = fs::File::open(path) {
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            match f.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    }
 }
 
 fn parse_ebook_meta(out: &str) -> (String, String, BTreeMap<String, String>) {
@@ -143,13 +152,59 @@ fn extract_metadata_rbook(epub_path: &Path, cover_dir: &Path, rel: &str) -> Opti
     })
 }
 
+fn run_command_with_timeout(
+    mut cmd: Command,
+    timeout: Duration,
+) -> Option<std::process::Output> {
+    use std::io::Read;
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let start = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut out = Vec::new();
+                let mut err = Vec::new();
+                if let Some(mut s) = child.stdout.take() {
+                    let _ = s.read_to_end(&mut out);
+                }
+                if let Some(mut s) = child.stderr.take() {
+                    let _ = s.read_to_end(&mut err);
+                }
+                return Some(std::process::Output {
+                    status,
+                    stdout: out,
+                    stderr: err,
+                });
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 fn extract_metadata_external(epub: &Path, cover_dir: &Path, rel: &str) -> BookEntry {
     let mut entry = BookEntry::default();
     let cover_path = cover_dir.join(cover_filename(rel));
     let _ = fs::remove_file(&cover_path);
     let cover_arg = format!("--get-cover={}", cover_path.display());
-    let output = Command::new("ebook-meta").arg(epub).arg(&cover_arg).output();
-    if let Ok(out) = output {
+    let mut cmd = Command::new("ebook-meta");
+    cmd.arg(epub).arg(&cover_arg);
+    let output = run_command_with_timeout(cmd, PARSE_TIMEOUT);
+    if let Some(out) = output {
         if out.status.success() {
             let s = String::from_utf8_lossy(&out.stdout).to_string();
             let (title, author, map) = parse_ebook_meta(&s);
@@ -157,11 +212,35 @@ fn extract_metadata_external(epub: &Path, cover_dir: &Path, rel: &str) -> BookEn
             entry.author = author;
             entry.metadata = map;
         }
+    } else {
+        entry
+            .metadata
+            .insert("_indexer_status".into(), "ebook-meta timed out".into());
     }
     if cover_path.exists() && fs::metadata(&cover_path).map(|m| m.len() > 0).unwrap_or(false) {
         entry.cover = Some(cover_path.to_string_lossy().to_string());
     }
     entry
+}
+
+fn extract_metadata_rbook_with_timeout(
+    epub_path: &Path,
+    cover_dir: &Path,
+    rel: &str,
+) -> Result<Option<BookEntry>, ()> {
+    let p = epub_path.to_path_buf();
+    let cd = cover_dir.to_path_buf();
+    let r = rel.to_string();
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = extract_metadata_rbook(&p, &cd, &r);
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(PARSE_TIMEOUT) {
+        Ok(v) => Ok(v),
+        Err(RecvTimeoutError::Timeout) => Err(()),
+        Err(RecvTimeoutError::Disconnected) => Ok(None),
+    }
 }
 
 fn extract_metadata(file: &Path, cover_dir: &Path, rel: &str) -> BookEntry {
@@ -171,8 +250,17 @@ fn extract_metadata(file: &Path, cover_dir: &Path, rel: &str) -> BookEntry {
         .map(|s| s.eq_ignore_ascii_case("epub"))
         .unwrap_or(false);
     if is_epub {
-        if let Some(e) = extract_metadata_rbook(file, cover_dir, rel) {
-            return e;
+        match extract_metadata_rbook_with_timeout(file, cover_dir, rel) {
+            Ok(Some(e)) => return e,
+            Ok(None) => {} // rbook failed cleanly, fall back
+            Err(()) => {
+                // rbook hung; thread is abandoned. Mark and skip ebook-meta to avoid double hang.
+                let mut entry = BookEntry::default();
+                entry
+                    .metadata
+                    .insert("_indexer_status".into(), "rbook timed out".into());
+                return entry;
+            }
         }
     }
     extract_metadata_external(file, cover_dir, rel)
@@ -182,6 +270,9 @@ fn open_db(root: &Path) -> Result<Connection> {
     let conn = Connection::open(root.join(DB_FILE))?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.pragma_update(None, "cache_size", -65536i64)?; // 64 MB
+    conn.pragma_update(None, "mmap_size", 268435456i64)?; // 256 MB
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS books (
             path TEXT PRIMARY KEY,
@@ -298,10 +389,10 @@ fn run_indexer(root: &Path, tx: &Sender<IndexUpdate>) -> Result<()> {
 
     let mut found: Vec<(String, u64, u64, PathBuf)> = Vec::new();
     for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
-        let p = entry.path();
-        if !p.is_file() {
+        if !entry.file_type().is_file() {
             continue;
         }
+        let p = entry.path();
         let ext_ok = p
             .extension()
             .and_then(|e| e.to_str())
@@ -315,16 +406,22 @@ fn run_indexer(root: &Path, tx: &Sender<IndexUpdate>) -> Result<()> {
         if !ext_ok {
             continue;
         }
+        let md = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let mt = md
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         let rel = p
             .strip_prefix(root)
             .unwrap_or(p)
             .to_string_lossy()
             .to_string();
-        let md = match fs::metadata(p) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        found.push((rel, md.len(), mtime_secs(p), p.to_path_buf()));
+        found.push((rel, md.len(), mt, p.to_path_buf()));
     }
     let found_keys: HashSet<String> = found.iter().map(|(r, _, _, _)| r.clone()).collect();
 
@@ -338,7 +435,7 @@ fn run_indexer(root: &Path, tx: &Sender<IndexUpdate>) -> Result<()> {
         }
     }
 
-    let to_index: Vec<(String, u64, u64, PathBuf)> = found
+    let mut to_index: Vec<(String, u64, u64, PathBuf)> = found
         .into_iter()
         .filter(|(rel, size, mt, _)| match existing.get(rel) {
             Some((s, m, c)) => {
@@ -350,6 +447,20 @@ fn run_indexer(root: &Path, tx: &Sender<IndexUpdate>) -> Result<()> {
         })
         .collect();
 
+    // Index epubs first — rbook is in-process and fast; other formats shell out to ebook-meta.
+    to_index.sort_by_key(|(rel, _, _, _)| {
+        let is_epub = Path::new(rel)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|s| s.eq_ignore_ascii_case("epub"))
+            .unwrap_or(false);
+        if is_epub {
+            0
+        } else {
+            1
+        }
+    });
+
     let total = to_index.len();
     let _ = tx.send(IndexUpdate::Total(total));
     if total == 0 {
@@ -358,7 +469,9 @@ fn run_indexer(root: &Path, tx: &Sender<IndexUpdate>) -> Result<()> {
 
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let mut in_batch = 0usize;
+    let mut batches_since_checkpoint = 0usize;
     for (i, (rel, size, mt, path)) in to_index.into_iter().enumerate() {
+        prewarm_file(&path);
         let mut e = extract_metadata(&path, &cover_dir, &rel);
         e.path = rel.clone();
         e.size = size;
@@ -371,15 +484,18 @@ fn run_indexer(root: &Path, tx: &Sender<IndexUpdate>) -> Result<()> {
         });
         in_batch += 1;
         if in_batch >= BATCH_SIZE {
-            conn.execute_batch("COMMIT; BEGIN IMMEDIATE")?;
+            conn.execute_batch("COMMIT")?;
+            batches_since_checkpoint += 1;
+            if batches_since_checkpoint >= CHECKPOINT_EVERY_BATCHES {
+                let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+                batches_since_checkpoint = 0;
+            }
+            conn.execute_batch("BEGIN IMMEDIATE")?;
             in_batch = 0;
         }
     }
-    if in_batch > 0 {
-        conn.execute_batch("COMMIT")?;
-    } else {
-        conn.execute_batch("COMMIT")?;
-    }
+    conn.execute_batch("COMMIT")?;
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
     Ok(())
 }
 
