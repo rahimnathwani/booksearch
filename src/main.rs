@@ -695,6 +695,18 @@ fn run_tui(initial: Vec<BookEntry>, rx: Receiver<IndexUpdate>) -> Result<()> {
 
     let picker = Picker::from_query_stdio().ok();
 
+    // Drain any leftover bytes from the terminal's reply to the graphics-protocol
+    // query (e.g. `<ESC>_Gi=31;OK<ESC>\`) so they don't get read as keystrokes.
+    let drain_deadline = Instant::now() + Duration::from_millis(50);
+    while Instant::now() < drain_deadline {
+        match event::poll(Duration::from_millis(10)) {
+            Ok(true) => {
+                let _ = event::read();
+            }
+            _ => break,
+        }
+    }
+
     let mut app = App::new(initial, rx, picker);
     let res = event_loop(&mut terminal, &mut app);
 
