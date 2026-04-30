@@ -43,6 +43,28 @@ struct BookEntry {
     author: String,
     metadata: BTreeMap<String, String>,
     cover: Option<String>,
+    /// Lowercased "filename(_→space) title author"; precomputed for fast filter matching.
+    /// Not persisted — rebuilt on load and on every Book update.
+    #[serde(skip)]
+    search_text: String,
+}
+
+fn build_search_text(b: &BookEntry) -> String {
+    let fname = Path::new(&b.path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default()
+        .replace('_', " ");
+    format!("{} {} {}", fname, b.title, b.author).to_lowercase()
+}
+
+fn parse_terms(filter: &str) -> Vec<String> {
+    filter
+        .trim()
+        .to_lowercase()
+        .split_whitespace()
+        .map(String::from)
+        .collect()
 }
 
 /// Sequentially read the file to warm the OS page cache before parsing.
@@ -149,6 +171,7 @@ fn extract_metadata_rbook(epub_path: &Path, cover_dir: &Path, rel: &str) -> Opti
         author,
         metadata: map,
         cover,
+        search_text: String::new(),
     })
 }
 
@@ -310,9 +333,16 @@ fn load_all_books(conn: &Connection) -> Result<Vec<BookEntry>> {
             author: r.get(4)?,
             cover: r.get(5)?,
             metadata: map,
+            search_text: String::new(),
         })
     })?;
-    Ok(rows.filter_map(Result::ok).collect())
+    Ok(rows
+        .filter_map(Result::ok)
+        .map(|mut b| {
+            b.search_text = build_search_text(&b);
+            b
+        })
+        .collect())
 }
 
 fn upsert_book(conn: &Connection, e: &BookEntry) -> Result<()> {
@@ -504,7 +534,10 @@ struct App {
     list_state: ListState,
     books: HashMap<String, BookEntry>,
     all_paths: Vec<String>,
-    filtered: Vec<String>,
+    /// Stack of (filter_string, paths_matching_that_filter). Bottom layer is always
+    /// ("", all_paths). Each typed char pushes a layer that refines the one below;
+    /// backspace pops. Top of stack is the current filtered view.
+    filter_stack: Vec<(String, Vec<String>)>,
     rx: Receiver<IndexUpdate>,
     progress: Option<(usize, usize)>,
     indexing_done: bool,
@@ -525,7 +558,7 @@ impl App {
             list_state: ListState::default(),
             books,
             all_paths,
-            filtered: Vec::new(),
+            filter_stack: Vec::new(),
             rx,
             progress: None,
             indexing_done: false,
@@ -533,8 +566,12 @@ impl App {
             cover_cache: HashMap::new(),
         };
         a.sort_paths();
-        a.recompute_filter();
+        a.rebuild_filter_stack();
         a
+    }
+
+    fn filtered(&self) -> &Vec<String> {
+        &self.filter_stack.last().expect("base layer always present").1
     }
 
     fn sort_paths(&mut self) {
@@ -548,9 +585,96 @@ impl App {
         });
     }
 
+    fn refine_paths(&self, base: &[String], terms: &[String]) -> Vec<String> {
+        if terms.is_empty() {
+            return base.to_vec();
+        }
+        base.iter()
+            .filter(|p| {
+                self.books
+                    .get(*p)
+                    .map(|b| terms.iter().all(|t| b.search_text.contains(t)))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Discard the cached stack and rebuild it from `all_paths` + the current filter.
+    /// Called when book data changes (so prior layers are stale) or when a non-incremental
+    /// filter transition is requested.
+    fn rebuild_filter_stack(&mut self) {
+        self.filter_stack.clear();
+        self.filter_stack
+            .push((String::new(), self.all_paths.clone()));
+        if !self.filter.is_empty() {
+            let terms = parse_terms(&self.filter);
+            let base = self.filter_stack[0].1.clone();
+            let filtered = self.refine_paths(&base, &terms);
+            self.filter_stack.push((self.filter.clone(), filtered));
+        }
+        self.clamp_selection();
+    }
+
+    /// Apply a new filter string. Tries to use the stack incrementally:
+    /// - if `new` extends the current top, refine the top's results (cheap: scans only the
+    ///   already-filtered subset)
+    /// - if `new` is a prefix of the current top, pop layers until matched (free)
+    /// - otherwise, full rebuild
+    fn set_filter(&mut self, new_filter: String) {
+        let cur = self
+            .filter_stack
+            .last()
+            .map(|(s, _)| s.clone())
+            .unwrap_or_default();
+        if new_filter == cur {
+            self.filter = new_filter;
+            return;
+        }
+        if new_filter.starts_with(&cur) {
+            let terms = parse_terms(&new_filter);
+            let base = self.filter_stack.last().unwrap().1.clone();
+            let filtered = self.refine_paths(&base, &terms);
+            self.filter_stack.push((new_filter.clone(), filtered));
+            self.filter = new_filter;
+            self.clamp_selection();
+        } else if cur.starts_with(&new_filter) {
+            while self.filter_stack.len() > 1
+                && self.filter_stack.last().unwrap().0 != new_filter
+            {
+                self.filter_stack.pop();
+            }
+            if self
+                .filter_stack
+                .last()
+                .map(|(s, _)| s.as_str())
+                != Some(new_filter.as_str())
+            {
+                self.filter = new_filter;
+                self.rebuild_filter_stack();
+            } else {
+                self.filter = new_filter;
+                self.clamp_selection();
+            }
+        } else {
+            self.filter = new_filter;
+            self.rebuild_filter_stack();
+        }
+    }
+
+    fn clamp_selection(&mut self) {
+        let len = self.filtered().len();
+        if len == 0 {
+            self.list_state.select(None);
+        } else {
+            let cur = self.list_state.selected().unwrap_or(0);
+            self.list_state.select(Some(cur.min(len - 1)));
+        }
+    }
+
     fn drain_updates(&mut self) -> bool {
         let mut changed = false;
-        let mut got_book = false;
+        let mut got_book_or_removal = false;
         loop {
             match self.rx.try_recv() {
                 Ok(IndexUpdate::Total(t)) => {
@@ -561,7 +685,8 @@ impl App {
                     self.progress = Some((done, total));
                     changed = true;
                 }
-                Ok(IndexUpdate::Book(b)) => {
+                Ok(IndexUpdate::Book(mut b)) => {
+                    b.search_text = build_search_text(&b);
                     let path = b.path.clone();
                     let is_new = !self.books.contains_key(&path);
                     self.books.insert(path.clone(), b);
@@ -569,13 +694,14 @@ impl App {
                         self.all_paths.push(path.clone());
                     }
                     self.cover_cache.remove(&path);
-                    got_book = true;
+                    got_book_or_removal = true;
                     changed = true;
                 }
                 Ok(IndexUpdate::Removed(path)) => {
                     self.books.remove(&path);
                     self.all_paths.retain(|p| p != &path);
                     self.cover_cache.remove(&path);
+                    got_book_or_removal = true;
                     changed = true;
                 }
                 Ok(IndexUpdate::Done) => {
@@ -589,17 +715,15 @@ impl App {
                 }
             }
         }
-        if got_book {
+        if got_book_or_removal {
             self.sort_paths();
-        }
-        if changed {
             let prev = self
                 .list_state
                 .selected()
-                .and_then(|i| self.filtered.get(i).cloned());
-            self.recompute_filter();
+                .and_then(|i| self.filtered().get(i).cloned());
+            self.rebuild_filter_stack();
             if let Some(p) = prev {
-                if let Some(i) = self.filtered.iter().position(|x| x == &p) {
+                if let Some(i) = self.filtered().iter().position(|x| x == &p) {
                     self.list_state.select(Some(i));
                 }
             }
@@ -607,55 +731,19 @@ impl App {
         changed
     }
 
-    fn match_book(b: &BookEntry, terms: &[String]) -> bool {
-        if terms.is_empty() {
-            return true;
-        }
-        let fname = Path::new(&b.path)
-            .file_name()
-            .map(|s| s.to_string_lossy().to_string())
-            .unwrap_or_default()
-            .replace('_', " ");
-        let hay = format!("{} {} {}", fname, b.title, b.author).to_lowercase();
-        terms.iter().all(|t| hay.contains(t))
-    }
-
-    fn recompute_filter(&mut self) {
-        let q = self.filter.trim().to_lowercase();
-        let terms: Vec<String> = q.split_whitespace().map(|s| s.to_string()).collect();
-        self.filtered = self
-            .all_paths
-            .iter()
-            .filter(|p| {
-                self.books
-                    .get(*p)
-                    .map(|b| Self::match_book(b, &terms))
-                    .unwrap_or(false)
-            })
-            .cloned()
-            .collect();
-        if self.filtered.is_empty() {
-            self.list_state.select(None);
-        } else {
-            let cur = self.list_state.selected().unwrap_or(0);
-            self.list_state
-                .select(Some(cur.min(self.filtered.len() - 1)));
-        }
-    }
-
     fn move_selection(&mut self, delta: i32) {
-        if self.filtered.is_empty() {
+        if self.filtered().is_empty() {
             return;
         }
         let cur = self.list_state.selected().unwrap_or(0) as i32;
-        let max = self.filtered.len() as i32 - 1;
+        let max = self.filtered().len() as i32 - 1;
         let new = (cur + delta).clamp(0, max);
         self.list_state.select(Some(new as usize));
     }
 
     fn selected_path(&self) -> Option<&String> {
         let idx = self.list_state.selected()?;
-        self.filtered.get(idx)
+        self.filtered().get(idx)
     }
 
     fn selected_book(&self) -> Option<&BookEntry> {
@@ -739,23 +827,25 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
                     KeyCode::Down => app.move_selection(1),
                     KeyCode::PageUp => app.move_selection(-10),
                     KeyCode::PageDown => app.move_selection(10),
-                    KeyCode::Home => app.list_state.select(if app.filtered.is_empty() {
+                    KeyCode::Home => app.list_state.select(if app.filtered().is_empty() {
                         None
                     } else {
                         Some(0)
                     }),
                     KeyCode::End => {
-                        if !app.filtered.is_empty() {
-                            app.list_state.select(Some(app.filtered.len() - 1));
+                        if !app.filtered().is_empty() {
+                            app.list_state.select(Some(app.filtered().len() - 1));
                         }
                     }
                     KeyCode::Backspace => {
-                        app.filter.pop();
-                        app.recompute_filter();
+                        let mut new = app.filter.clone();
+                        new.pop();
+                        app.set_filter(new);
                     }
                     KeyCode::Char(c) => {
-                        app.filter.push(c);
-                        app.recompute_filter();
+                        let mut new = app.filter.clone();
+                        new.push(c);
+                        app.set_filter(new);
                     }
                     _ => {}
                 }
@@ -771,19 +861,17 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         .split(f.area());
 
     let filter_text = format!("{}_", app.filter);
+    let match_count = app.filtered().len();
     let title = match (app.progress, app.indexing_done) {
         (_, true) => format!(
             "Filter ({} matches, {} books)",
-            app.filtered.len(),
+            match_count,
             app.books.len()
         ),
-        (Some((d, t)), false) if t > 0 => format!(
-            "Filter ({} matches, indexing {}/{})",
-            app.filtered.len(),
-            d,
-            t
-        ),
-        _ => format!("Filter ({} matches, scanning...)", app.filtered.len()),
+        (Some((d, t)), false) if t > 0 => {
+            format!("Filter ({} matches, indexing {}/{})", match_count, d, t)
+        }
+        _ => format!("Filter ({} matches, scanning...)", match_count),
     };
     let filter = Paragraph::new(filter_text)
         .block(Block::default().borders(Borders::ALL).title(title));
@@ -795,7 +883,7 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
         .split(chunks[1]);
 
     let items: Vec<ListItem> = app
-        .filtered
+        .filtered()
         .iter()
         .filter_map(|p| app.books.get(p))
         .map(|b| {
