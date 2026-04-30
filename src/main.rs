@@ -4,12 +4,18 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
+use futures::FutureExt;
+use magic_wormhole::{
+    transfer,
+    transit::{self, RelayHint},
+    MailboxConnection, Wormhole,
+};
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    style::{Modifier, Style},
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap},
     Terminal,
 };
 use ratatui_image::{picker::Picker, protocol::StatefulProtocol, StatefulImage};
@@ -27,6 +33,126 @@ use std::{
     time::{Duration, Instant, UNIX_EPOCH},
 };
 use walkdir::WalkDir;
+
+const WORMHOLE_URL: &str = "https://github.com/magic-wormhole/magic-wormhole";
+
+#[derive(Debug)]
+enum ShareEvent {
+    Code(String),
+    Connected,
+    Progress { sent: u64, total: u64 },
+    Done,
+    Error(String),
+}
+
+struct ShareHandle {
+    events: Receiver<ShareEvent>,
+    cancel: async_channel::Sender<()>,
+    file_name: String,
+}
+
+struct ShareState {
+    handle: ShareHandle,
+    code: Option<String>,
+    connected: bool,
+    progress: Option<(u64, u64)>,
+    finished: bool,
+    error: Option<String>,
+}
+
+impl ShareState {
+    fn new(handle: ShareHandle) -> Self {
+        Self {
+            handle,
+            code: None,
+            connected: false,
+            progress: None,
+            finished: false,
+            error: None,
+        }
+    }
+}
+
+fn start_share(file: PathBuf) -> ShareHandle {
+    let file_name = file
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".into());
+    let (event_tx, event_rx) = mpsc::channel();
+    let (cancel_tx, cancel_rx) = async_channel::unbounded::<()>();
+    let name_for_thread = file_name.clone();
+    thread::spawn(move || {
+        smol::block_on(async move {
+            let tx = event_tx.clone();
+            let result = run_share(file, name_for_thread, tx.clone(), cancel_rx).await;
+            if let Err(e) = result {
+                let _ = tx.send(ShareEvent::Error(format!("{e:#}")));
+            }
+            let _ = tx.send(ShareEvent::Done);
+        });
+    });
+    ShareHandle {
+        events: event_rx,
+        cancel: cancel_tx,
+        file_name,
+    }
+}
+
+async fn run_share(
+    path: PathBuf,
+    file_name: String,
+    tx: Sender<ShareEvent>,
+    cancel_rx: async_channel::Receiver<()>,
+) -> anyhow::Result<()> {
+    let mailbox =
+        MailboxConnection::create(transfer::APP_CONFIG, 2)
+            .await
+            .map_err(|e| anyhow::anyhow!("mailbox: {e}"))?;
+    let _ = tx.send(ShareEvent::Code(mailbox.code().to_string()));
+
+    let cancel_fut = {
+        let rx = cancel_rx.clone();
+        async move {
+            let _ = rx.recv().await;
+        }
+    }
+    .shared();
+
+    let wormhole = futures::select! {
+        w = Wormhole::connect(mailbox).fuse() => w.map_err(|e| anyhow::anyhow!("connect: {e}"))?,
+        () = cancel_fut.clone().fuse() => return Ok(()),
+    };
+    let _ = tx.send(ShareEvent::Connected);
+
+    let relay_hints: Vec<RelayHint> = vec![RelayHint::from_urls(
+        None,
+        [transit::DEFAULT_RELAY_SERVER.parse()?],
+    )?];
+    let abilities = transit::Abilities::ALL;
+
+    let offer = transfer::offer::OfferSend::new_file_or_folder(file_name, path)
+        .await
+        .map_err(|e| anyhow::anyhow!("offer: {e}"))?;
+
+    let progress_tx = tx.clone();
+    let progress = move |sent: u64, total: u64| {
+        let _ = progress_tx.send(ShareEvent::Progress { sent, total });
+    };
+    let transit_handler = |_info: transit::TransitInfo| {};
+
+    transfer::send(
+        wormhole,
+        relay_hints,
+        abilities,
+        offer,
+        &transit_handler,
+        progress,
+        cancel_fut,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("send: {e}"))?;
+    Ok(())
+}
 
 const DB_FILE: &str = ".booksearch.db";
 const COVER_DIR: &str = ".booksearch_covers";
@@ -543,10 +669,17 @@ struct App {
     indexing_done: bool,
     picker: Option<Picker>,
     cover_cache: HashMap<String, Option<StatefulProtocol>>,
+    share: Option<ShareState>,
+    root: PathBuf,
 }
 
 impl App {
-    fn new(initial: Vec<BookEntry>, rx: Receiver<IndexUpdate>, picker: Option<Picker>) -> Self {
+    fn new(
+        initial: Vec<BookEntry>,
+        rx: Receiver<IndexUpdate>,
+        picker: Option<Picker>,
+        root: PathBuf,
+    ) -> Self {
         let mut books = HashMap::new();
         let mut all_paths = Vec::with_capacity(initial.len());
         for b in initial {
@@ -564,6 +697,8 @@ impl App {
             indexing_done: false,
             picker,
             cover_cache: HashMap::new(),
+            share: None,
+            root,
         };
         a.sort_paths();
         a.rebuild_filter_stack();
@@ -731,6 +866,52 @@ impl App {
         changed
     }
 
+    fn drain_share(&mut self) {
+        let Some(state) = self.share.as_mut() else {
+            return;
+        };
+        loop {
+            match state.handle.events.try_recv() {
+                Ok(ShareEvent::Code(c)) => state.code = Some(c),
+                Ok(ShareEvent::Connected) => state.connected = true,
+                Ok(ShareEvent::Progress { sent, total }) => {
+                    state.progress = Some((sent, total))
+                }
+                Ok(ShareEvent::Error(e)) => {
+                    state.error = Some(e);
+                    state.finished = true;
+                }
+                Ok(ShareEvent::Done) => state.finished = true,
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    state.finished = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn start_share_for_selected(&mut self) {
+        if self.share.is_some() {
+            return;
+        }
+        let Some(book) = self.selected_book() else {
+            return;
+        };
+        let abs = self.root.join(&book.path);
+        if !abs.exists() {
+            return;
+        }
+        let handle = start_share(abs);
+        self.share = Some(ShareState::new(handle));
+    }
+
+    fn cancel_share(&mut self) {
+        if let Some(state) = self.share.take() {
+            let _ = state.handle.cancel.try_send(());
+        }
+    }
+
     fn move_selection(&mut self, delta: i32) {
         if self.filtered().is_empty() {
             return;
@@ -795,7 +976,8 @@ fn run_tui(initial: Vec<BookEntry>, rx: Receiver<IndexUpdate>) -> Result<()> {
         }
     }
 
-    let mut app = App::new(initial, rx, picker);
+    let root = std::env::current_dir()?;
+    let mut app = App::new(initial, rx, picker, root);
     let res = event_loop(&mut terminal, &mut app);
 
     disable_raw_mode()?;
@@ -811,6 +993,7 @@ fn run_tui(initial: Vec<BookEntry>, rx: Receiver<IndexUpdate>) -> Result<()> {
 fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
     loop {
         app.drain_updates();
+        app.drain_share();
         terminal.draw(|f| draw(f, app))?;
         if event::poll(Duration::from_millis(150))? {
             if let Event::Key(key) = event::read()? {
@@ -818,11 +1001,23 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
                 {
                     continue;
                 }
+                if app.share.is_some() {
+                    match key.code {
+                        KeyCode::Esc => app.cancel_share(),
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            app.cancel_share();
+                            return Ok(());
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
                 match key.code {
                     KeyCode::Esc => return Ok(()),
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         return Ok(());
                     }
+                    KeyCode::Enter => app.start_share_for_selected(),
                     KeyCode::Up => app.move_selection(-1),
                     KeyCode::Down => app.move_selection(1),
                     KeyCode::PageUp => app.move_selection(-10),
@@ -970,9 +1165,125 @@ fn draw(f: &mut ratatui::Frame, app: &mut App) {
     f.render_widget(details, right[1]);
 
     let help = Paragraph::new(
-        "Type to filter · Backspace · ↑↓ navigate · PgUp/PgDn · Home/End · Esc quit",
+        "Type to filter · ↑↓ navigate · Enter share · Esc quit",
     );
     f.render_widget(help, chunks[2]);
+
+    if app.share.is_some() {
+        draw_share_modal(f, app);
+    }
+}
+
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    Rect {
+        x: area.x + (area.width.saturating_sub(w)) / 2,
+        y: area.y + (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    }
+}
+
+fn draw_share_modal(f: &mut ratatui::Frame, app: &App) {
+    let Some(state) = app.share.as_ref() else {
+        return;
+    };
+    let area = centered_rect(70, 14, f.area());
+    f.render_widget(Clear, area);
+    let title = if state.finished {
+        if state.error.is_some() {
+            "Share — error (Esc to close)"
+        } else {
+            "Share — done (Esc to close)"
+        }
+    } else {
+        "Sharing via magic-wormhole (Esc to cancel)"
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .style(Style::default());
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+
+    let file_line = Paragraph::new(Line::from(vec![
+        Span::styled("File: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(state.handle.file_name.clone()),
+    ]));
+    f.render_widget(file_line, layout[0]);
+
+    let code_text = match &state.code {
+        Some(c) => c.clone(),
+        None => "(allocating…)".into(),
+    };
+    let code_line = Paragraph::new(vec![
+        Line::from(Span::styled(
+            "Code:",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            code_text,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+    ]);
+    f.render_widget(code_line, layout[1]);
+
+    let info_lines = vec![
+        Line::from(vec![
+            Span::styled("Recipient: ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw("install magic-wormhole and run:"),
+        ]),
+        Line::from(Span::raw(format!(
+            "  wormhole receive {}",
+            state.code.clone().unwrap_or_default()
+        ))),
+    ];
+    f.render_widget(Paragraph::new(info_lines), layout[2]);
+
+    let url_line = Paragraph::new(Line::from(vec![
+        Span::styled("Get it: ", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(WORMHOLE_URL),
+    ]));
+    f.render_widget(url_line, layout[3]);
+
+    let status = if let Some(e) = &state.error {
+        format!("Error: {}", e)
+    } else if state.finished {
+        "Transfer complete.".into()
+    } else if let Some((sent, total)) = state.progress {
+        format!("Transferring: {} / {} bytes", sent, total)
+    } else if state.connected {
+        "Peer connected; negotiating transit…".into()
+    } else {
+        "Waiting for receiver…".into()
+    };
+    f.render_widget(Paragraph::new(status), layout[4]);
+
+    if let Some((sent, total)) = state.progress {
+        if total > 0 {
+            let ratio = (sent as f64 / total as f64).clamp(0.0, 1.0);
+            let gauge = Gauge::default()
+                .block(Block::default())
+                .gauge_style(Style::default().fg(Color::Green))
+                .ratio(ratio);
+            f.render_widget(gauge, layout[5]);
+        }
+    }
 }
 
 fn main() -> Result<()> {

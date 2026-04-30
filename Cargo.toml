@@ -14,6 +14,10 @@ ratatui-image = { version = "10", default-features = false, features = ["crosste
 image = "0.25"
 rusqlite = { version = "0.32", features = ["bundled"] }
 rbook = "0.7"
+magic-wormhole = { version = "0.8", default-features = false, features = ["transfer", "transit", "tls"] }
+smol = "2"
+async-channel = "2"
+futures = "0.3"
 
 [profile.release]
 lto = true
