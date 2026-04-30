@@ -12,7 +12,7 @@ use magic_wormhole::{
 };
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap},
@@ -1285,7 +1285,12 @@ fn draw_share_modal(f: &mut ratatui::Frame, app: &App) {
         }
     } else if let Some(code) = &state.code {
         if let Some(qr) = render_qr(&format!("wormhole-transfer:{code}")) {
-            f.render_widget(Paragraph::new(qr), layout[5]);
+            f.render_widget(
+                Paragraph::new(qr)
+                    .alignment(Alignment::Center)
+                    .style(Style::default().fg(Color::Black).bg(Color::White)),
+                layout[5],
+            );
         }
     }
 }
@@ -1293,14 +1298,26 @@ fn draw_share_modal(f: &mut ratatui::Frame, app: &App) {
 fn render_qr(data: &str) -> Option<String> {
     use qrcode::render::unicode;
     let code = qrcode::QrCode::new(data.as_bytes()).ok()?;
-    // Dark modules render as the unicode half-block; light as space.
-    // On a dark terminal this produces a light-on-dark QR, which most
-    // modern scanners read fine.
-    Some(
-        code.render::<unicode::Dense1x2>()
-            .quiet_zone(true)
-            .build(),
-    )
+    let qr = code
+        .render::<unicode::Dense1x2>()
+        .quiet_zone(true)
+        .build();
+    // Wrap with a 1-cell padding so the white background extends one block
+    // around the QR. Caller paints fg=Black bg=White, giving the conventional
+    // printed-on-paper appearance that scanners expect.
+    let width = qr.lines().next().map(|l| l.chars().count()).unwrap_or(0);
+    let pad_line: String = " ".repeat(width + 2);
+    let mut out = String::with_capacity(qr.len() + width * 4 + 8);
+    out.push_str(&pad_line);
+    out.push('\n');
+    for line in qr.lines() {
+        out.push(' ');
+        out.push_str(line);
+        out.push(' ');
+        out.push('\n');
+    }
+    out.push_str(&pad_line);
+    Some(out)
 }
 
 fn main() -> Result<()> {
