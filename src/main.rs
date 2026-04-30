@@ -1189,7 +1189,7 @@ fn draw_share_modal(f: &mut ratatui::Frame, app: &App) {
     let Some(state) = app.share.as_ref() else {
         return;
     };
-    let area = centered_rect(70, 14, f.area());
+    let area = centered_rect(70, 30, f.area());
     f.render_widget(Clear, area);
     let title = if state.finished {
         if state.error.is_some() {
@@ -1283,7 +1283,24 @@ fn draw_share_modal(f: &mut ratatui::Frame, app: &App) {
                 .ratio(ratio);
             f.render_widget(gauge, layout[5]);
         }
+    } else if let Some(code) = &state.code {
+        if let Some(qr) = render_qr(&format!("wormhole-transfer:{code}")) {
+            f.render_widget(Paragraph::new(qr), layout[5]);
+        }
     }
+}
+
+fn render_qr(data: &str) -> Option<String> {
+    use qrcode::render::unicode;
+    let code = qrcode::QrCode::new(data.as_bytes()).ok()?;
+    // Dark modules render as the unicode half-block; light as space.
+    // On a dark terminal this produces a light-on-dark QR, which most
+    // modern scanners read fine.
+    Some(
+        code.render::<unicode::Dense1x2>()
+            .quiet_zone(true)
+            .build(),
+    )
 }
 
 fn main() -> Result<()> {

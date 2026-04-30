@@ -18,6 +18,7 @@ magic-wormhole = { version = "0.8", default-features = false, features = ["trans
 smol = "2"
 async-channel = "2"
 futures = "0.3"
+qrcode = { version = "0.14", default-features = false }
 
 [profile.release]
 lto = true
